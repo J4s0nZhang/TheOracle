@@ -1,0 +1,2 @@
+# TheOracle
+MTG helper tools
