@@ -1,7 +1,10 @@
-# Skill: Technical Context Handoff
+---
+name: core-handoff
+description: Generates an ultra-dense technical engineering checkpoint file (AGENT_HANDOFF.md) in the project root so a fresh AI agent can immediately resume the current task without losing state, repeating failed approaches, or wasting context on exploratory commands.
+disable-model-invocation: true
+---
 
-## Description
-Generates an ultra-dense, highly technical engineering checkpoint file (`AGENT_HANDOFF.md`) in the project root. This file enables a fresh AI agent to immediately resume the current engineering task without losing state, repeating failed approaches, or wasting context tokens on exploratory commands.
+# Skill: Technical Context Handoff
 
 ## When to Use
 - When the user explicitly requests a checkpoint, handoff, or state save.
@@ -42,3 +45,4 @@ Write a markdown file named `AGENT_HANDOFF.md` directly to the project root. Do 
 ## 5. Dead Ends & Rationale (Do Not Repeat)
 - **Tried & Failed:** [Specific approach/library tried] -> **Reason:** [Why it failed/token drain]
 - **Architectural Pivot:** [Why a specific design pattern or fix was chosen over another during this session]
+```
