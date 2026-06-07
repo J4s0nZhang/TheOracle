@@ -1,1 +1,6 @@
 __pycache__/
+*.pyc
+*.egg-info/
+dist/
+.scryfall_sets_cache.json
+AGENT_HANDOFF.md
