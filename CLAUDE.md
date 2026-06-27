@@ -18,9 +18,12 @@ src/theoracle/
     __init__.py
     card_parser.py        # OCR normalization + Scryfall lookup pipeline
     draft_arbiter.py      # MTG booster draft session manager
+    db.py                 # SQLite connection factory + migration runner
+migrations/
+    001_initial.sql       # initial schema (sessions, players, picks, results)
 tests/
     test_card_parser.py   # 47 unit tests, all mocked (no network)
-    test_draft_arbiter.py # 54 unit tests, pure in-memory
+    test_draft_arbiter.py # 54 unit tests, SQLite via tmp_path
 pyproject.toml            # dependencies, build config, pytest config
 ```
 
@@ -80,12 +83,12 @@ card: CardData | None = parse_card_identifier("M21/123")
 
 ## Module: `theoracle.draft_arbiter`
 
-One `DraftArbiter` instance per live draft session. Holds all live state in RAM; persists to a CSV file via `save()`. Thread-safe — a single `threading.RLock` serialises all mutations. Pack contents are never known up front; they are reconstructed from the ordered pick history after a pack is fully drafted.
+One `DraftArbiter` instance per live draft session. Holds all live state in RAM; persists to a SQLite database via `save()`. Thread-safe — a single `threading.RLock` serialises all mutations. Pack contents are never known up front; they are reconstructed from the ordered pick history after a pack is fully drafted.
 
 ### Architecture decisions
 - **One arbiter per session** — correct granularity for a web backend (route by `session_id`, each arbiter owns its lock).
 - **No session registry here** — managing multiple live arbiters belongs to the FastAPI layer (planned separately).
-- **CSV persistence is a stepping stone** — intentionally thin so it can be swapped for a proper SQL schema later.
+- **SQLite persistence via raw SQL migrations** — schema lives in `migrations/001_initial.sql`; `db.py` applies migrations automatically on connection open. Migration history tracked in `schema_migrations` table.
 - **Explicit round advancement** — `record_pick` never auto-advances rounds. The coordinator calls `advance_round()` after `is_round_complete()` returns `True`, giving the web layer a natural gate for "round over" UI.
 
 ### Public API
@@ -98,7 +101,7 @@ arbiter = DraftArbiter(
     pack_size=15,                        # default
     rounds=["left", "right", "left"],    # default
     player_names=["Alice", "Bob", ...],  # default: ["seat_0", ..., "seat_N-1"]
-    save_path="drafts.csv",              # default: "{session_id}.csv"
+    db_path="drafts.db",                 # optional; save() raises if None
 )
 
 event: PickEvent = arbiter.record_pick(seat=0, card_name="Lightning Bolt")
@@ -109,7 +112,7 @@ if arbiter.is_round_complete():
 arbiter.record_result(winner_seat=2)
 arbiter.save()
 
-arbiter2 = DraftArbiter.load("drafts.csv")
+arbiter2 = DraftArbiter.load("drafts.db", "draft-2026-06-20")
 ```
 
 ### Data classes
@@ -118,7 +121,7 @@ arbiter2 = DraftArbiter.load("drafts.csv")
 | `PickEvent` | `pack_id`, `seat`, `pick_index`, `card_name` — **frozen** (immutable record) |
 | `LogicalPack` | `pack_id`, `round_number`, `origin_seat`, `pack_size`, `pass_direction`, `picks` |
 | `PlayerStats` | `player_name`, `picked_cards: list[str]` (primary), `wins`, `losses`, `win_rate`, `card_count(name)` |
-| `CardStats` | `card_name`, `times_selected` — computed from CSV on demand |
+| `CardStats` | `card_name`, `times_selected` — computed from DB on demand |
 
 ### Pack identity
 `pack_id = f"R{round_number}S{origin_seat}"` — e.g. `"R0S2"` is the pack that originated at seat 2 in round 0.
@@ -137,10 +140,14 @@ arbiter.replay_draft()                     # list[PickEvent] in recording order
 
 ### Stats
 - `get_player_stats(seat)` / `get_all_player_stats()` — from RAM; `picked_cards` is the ordered pick history (primary).
-- `get_card_stats(name)` / `get_all_card_stats()` — reads CSV, combines with current session RAM (no double-counting).
+- `get_card_stats(name)` / `get_all_card_stats()` — queries DB for other sessions, combines with current session RAM (no double-counting).
 
-### CSV schema
-Single file, `row_type` discriminator: `METADATA` | `PICK` | `RESULT`. Multiple sessions can share one file; `save()` preserves other sessions' rows.
+### SQL schema (SQLite)
+Five tables: `sessions`, `session_rounds`, `players`, `picks`, `results`. Multiple sessions share one DB file. Key design choices:
+- `picks.pick_index` — 0-based position within a pack (enables avg-pick-order queries directly)
+- `picks.player_pick_num` — 0-based sequential pick number for that player within the session (stored at save time; avoids window functions for "first X picks" queries)
+- `picks(round_number, origin_seat)` decompose `pack_id` for queryable pack reconstruction
+- Indexes: `(card_name, pick_index)`, `(session_id, seat, player_pick_num)`, `(session_id, round_number, origin_seat)`, `(session_id, winner_seat)`
 
 ### Error behaviour
 - `ValueError` on all structural violations (invalid seat, round not complete, pack not complete, etc.)
@@ -155,16 +162,13 @@ Single file, `row_type` discriminator: `METADATA` | `PICK` | `RESULT`. Multiple 
 - All external I/O (network, file, time) must be mockable — no bare `requests.get` calls outside `_safe_get`
 - Tests must never hit the network — patch `theoracle.card_parser.requests.get` and `theoracle.card_parser.time.sleep`
 - `autouse` fixture `no_sleep` suppresses `time.sleep` globally in `test_card_parser.py`
-- Draft arbiter tests use `tmp_path` fixture for CSV I/O; no mocking needed (pure in-memory except persistence tests)
+- Draft arbiter tests use `tmp_path` fixture for SQLite I/O; no mocking needed (pure in-memory except persistence tests)
 
 ---
 
 ## Planned Next Steps
 
-### Priority 1 — SQL schema design
-Replace CSV persistence in `DraftArbiter` with a proper relational schema. The CSV layer is intentionally thin (`save()` / `load()` isolated to ~60 lines) to make this swap straightforward.
-
-### Priority 2 — FastAPI web backend
+### Priority 1 — FastAPI web backend
 Session registry + HTTP endpoints. Key design: one `DraftArbiter` per live session, registry maps `session_id → DraftArbiter`, loaded from DB on server startup.
 - `POST /sessions` — create session
 - `POST /sessions/{id}/picks` — record pick

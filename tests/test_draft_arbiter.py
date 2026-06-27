@@ -23,7 +23,7 @@ def _make_arbiter(tmp_path, **kwargs) -> DraftArbiter:
         pack_size=3,
         rounds=["left"],
         player_names=["Alice", "Bob", "Charlie"],
-        save_path=str(tmp_path / "test.csv"),
+        db_path=str(tmp_path / "test.db"),
     )
     defaults.update(kwargs)
     return DraftArbiter(**defaults)
@@ -125,12 +125,12 @@ def test_constructor_player_names_length_mismatch(tmp_path):
 
 
 def test_constructor_default_rounds(tmp_path):
-    a = DraftArbiter("s1", num_players=2, save_path=str(tmp_path / "t.csv"))
+    a = DraftArbiter("s1", num_players=2, db_path=str(tmp_path / "t.db"))
     assert a._rounds == ["left", "right", "left"]
 
 
 def test_constructor_default_player_names(tmp_path):
-    a = DraftArbiter("s1", num_players=2, save_path=str(tmp_path / "t.csv"))
+    a = DraftArbiter("s1", num_players=2, db_path=str(tmp_path / "t.db"))
     assert a.player_names == ["seat_0", "seat_1"]
 
 
@@ -334,7 +334,7 @@ def test_player_stats_picked_cards_grow_with_picks(tmp_path):
 
 def test_player_stats_default_names(tmp_path):
     a = DraftArbiter("s1", num_players=2, pack_size=1, rounds=["left"],
-                     save_path=str(tmp_path / "t.csv"))
+                     db_path=str(tmp_path / "t.db"))
     a.record_pick(0, "A")
     a.record_pick(1, "B")
     a.advance_round()
@@ -392,7 +392,7 @@ def test_concurrent_picks_no_lost_events(tmp_path):
     a = DraftArbiter(
         "s1", num_players=2, pack_size=20, rounds=["left"],
         player_names=["P0", "P1"],
-        save_path=str(tmp_path / "t.csv"),
+        db_path=str(tmp_path / "t.db"),
     )
     errors: list[Exception] = []
     barrier = threading.Barrier(2)
@@ -422,7 +422,7 @@ def test_concurrent_picks_no_lost_events(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Section 13 — CSV persistence
+# Section 13 — SQL persistence
 # ---------------------------------------------------------------------------
 
 def test_save_and_load_restores_picks(tmp_path):
@@ -432,7 +432,7 @@ def test_save_and_load_restores_picks(tmp_path):
     a.advance_round()
     a.save()
 
-    b = DraftArbiter.load(str(tmp_path / "test.csv"))
+    b = DraftArbiter.load(str(tmp_path / "test.db"), "s1")
     assert b.session_id == "s1"
     assert b.is_draft_complete()
     assert b.get_full_pack("R0S0") == [cards[0], cards[3], cards[6]]
@@ -446,59 +446,58 @@ def test_save_and_load_restores_player_stats(tmp_path):
     a.record_result(0)
     a.save()
 
-    b = DraftArbiter.load(str(tmp_path / "test.csv"))
+    b = DraftArbiter.load(str(tmp_path / "test.db"), "s1")
     assert b.get_player_stats(0).wins == 1
     assert b.get_player_stats(1).losses == 1
-    # Seat 0's picked_cards should match
     assert b.get_player_stats(0).picked_cards == a.get_player_stats(0).picked_cards
 
 
 def test_save_preserves_other_sessions(tmp_path):
-    csv_path = str(tmp_path / "shared.csv")
+    db_path = str(tmp_path / "shared.db")
 
     a = DraftArbiter("s1", num_players=2, pack_size=1, rounds=["left"],
-                     save_path=csv_path)
+                     db_path=db_path)
     a.record_pick(0, "CardA")
     a.record_pick(1, "CardB")
     a.advance_round()
     a.save()
 
     b = DraftArbiter("s2", num_players=2, pack_size=1, rounds=["left"],
-                     save_path=csv_path)
+                     db_path=db_path)
     b.record_pick(0, "CardC")
     b.record_pick(1, "CardD")
     b.advance_round()
     b.save()
 
     # Reload s1 — s2's data must not have been destroyed
-    a2 = DraftArbiter.load(csv_path)
+    a2 = DraftArbiter.load(db_path, "s1")
     assert a2.get_full_pack("R0S0") == ["CardA"]
 
 
 def test_load_raises_if_file_missing(tmp_path):
     with pytest.raises(FileNotFoundError):
-        DraftArbiter.load(str(tmp_path / "nonexistent.csv"))
+        DraftArbiter.load(str(tmp_path / "nonexistent.db"), "s1")
 
 
 def test_get_card_stats_aggregates_across_sessions(tmp_path):
-    csv_path = str(tmp_path / "shared.csv")
+    db_path = str(tmp_path / "shared.db")
 
     a = DraftArbiter("s1", num_players=2, pack_size=1, rounds=["left"],
-                     save_path=csv_path)
+                     db_path=db_path)
     a.record_pick(0, "Lightning Bolt")
     a.record_pick(1, "Counterspell")
     a.advance_round()
     a.save()
 
     b = DraftArbiter("s2", num_players=2, pack_size=1, rounds=["left"],
-                     save_path=csv_path)
+                     db_path=db_path)
     b.record_pick(0, "Lightning Bolt")
     b.record_pick(1, "Island")
     b.advance_round()
 
     stats = b.get_card_stats("Lightning Bolt")
     assert stats is not None
-    assert stats.times_selected == 2  # 1 from s1 CSV + 1 from s2 RAM
+    assert stats.times_selected == 2  # 1 from s1 DB + 1 from s2 RAM
 
 
 def test_get_card_stats_unknown_returns_none(tmp_path):
@@ -518,7 +517,7 @@ def test_record_pick_invalid_seat(tmp_path):
 
 def test_record_pick_no_pack_at_seat(tmp_path):
     a = DraftArbiter("s1", num_players=2, pack_size=2, rounds=["left"],
-                     save_path=str(tmp_path / "t.csv"))
+                     db_path=str(tmp_path / "t.db"))
     a.record_pick(0, "First")  # R0S0 moves to seat 1; seat 0 queue is now empty
     with pytest.raises(ValueError, match="no pack available"):
         a.record_pick(0, "Oops")

@@ -2,7 +2,7 @@
 draft_arbiter.py — MTG booster draft session manager.
 
 One DraftArbiter instance per live draft session. Holds all live state in RAM,
-persists to a CSV file via save(), and reconstructs from that file via load().
+persists to a SQLite database via save(), and reconstructs from it via load().
 Thread-safe: a single RLock serialises all mutations.
 
 Pack contents are never known up front. They are reconstructed after a pack is
@@ -11,12 +11,12 @@ fully drafted from the ordered pick history.
 
 from __future__ import annotations
 
-import csv
 import threading
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
+
+from . import db
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -24,13 +24,6 @@ from pathlib import Path
 
 _DEFAULT_ROUNDS: list[str] = ["left", "right", "left"]
 _VALID_DIRECTIONS: frozenset[str] = frozenset({"left", "right"})
-
-_CSV_FIELDS = [
-    "row_type", "session_id", "num_players", "pack_size", "rounds",
-    "player_names", "is_complete", "current_round",
-    "pack_id", "seat", "player_name", "pick_index",
-    "card_name", "winner_seat", "timestamp",
-]
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -92,7 +85,7 @@ class DraftArbiter:
         pack_size: int = 15,
         rounds: list[str] | None = None,
         player_names: list[str] | None = None,
-        save_path: str | None = None,
+        db_path: str | None = None,
     ) -> None:
         """
         Create a new draft session.
@@ -108,7 +101,7 @@ class DraftArbiter:
                 ["left", "right", "left"]. Each value must be "left" or "right".
             player_names: Display names for seats 0..N-1. Defaults to
                 ["seat_0", ..., "seat_N-1"]. Length must equal num_players.
-            save_path: Path for CSV persistence. Defaults to "{session_id}.csv".
+            db_path: Path to the SQLite database file. If None, save() is unavailable.
         """
         if num_players < 2:
             raise ValueError("num_players must be >= 2")
@@ -134,7 +127,7 @@ class DraftArbiter:
         self._pack_size = pack_size
         self._rounds = resolved_rounds
         self._player_names = resolved_names
-        self._save_path = Path(save_path) if save_path else Path(f"{session_id}.csv")
+        self._conn = db.get_connection(db_path) if db_path is not None else None
 
         self._lock = threading.RLock()
         self._packs: dict[str, LogicalPack] = {}
@@ -488,28 +481,27 @@ class DraftArbiter:
 
     def _aggregate_card_counts(self) -> dict[str, int]:
         """
-        Aggregate pick counts across all sessions in the CSV and current RAM state.
+        Aggregate pick counts across all sessions in the database and current RAM state.
 
-        Reads PICK rows from other sessions in the CSV file, then merges in the
-        current session's in-memory events so the caller sees a unified view
-        without double-counting the current session.
+        Reads picks from other sessions in the DB, then merges in the current
+        session's in-memory events so the caller sees a unified view without
+        double-counting the current session.
 
         Returns:
             counts: Mapping of card name to total times selected.
         """
-        counts: dict[str, int] = {}
-        # Historical picks from other sessions in the CSV file
-        if self._save_path.exists():
-            with self._save_path.open(newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row["row_type"] == "PICK" and row["session_id"] != self._session_id:
-                        card = row["card_name"]
-                        counts[card] = counts.get(card, 0) + 1
-        # Current session picks from RAM
         with self._lock:
+            counts: dict[str, int] = {}
+            if self._conn is not None:
+                for row in self._conn.execute(
+                    "SELECT card_name, COUNT(*) as n FROM picks "
+                    "WHERE session_id != ? GROUP BY card_name",
+                    (self._session_id,),
+                ):
+                    counts[row["card_name"]] = row["n"]
             for event in self._pick_events:
                 counts[event.card_name] = counts.get(event.card_name, 0) + 1
-        return counts
+            return counts
 
     # ------------------------------------------------------------------
     # Persistence
@@ -517,138 +509,131 @@ class DraftArbiter:
 
     def save(self) -> None:
         """
-        Persist the current session to the CSV file.
+        Persist the current session to the SQLite database.
 
-        Preserves rows belonging to other sessions already in the file, then
-        rewrites METADATA, PICK, and RESULT rows for this session. Safe to call
-        multiple times; each call is a full overwrite of this session's rows.
+        Safe to call multiple times; picks are inserted idempotently and session
+        metadata is upserted. Results are deleted and reinserted on each call.
         """
         with self._lock:
-            existing: list[dict] = []
-            if self._save_path.exists():
-                with self._save_path.open(newline="", encoding="utf-8") as f:
-                    for row in csv.DictReader(f):
-                        if row.get("session_id") != self._session_id:
-                            existing.append(dict(row))
+            if self._conn is None:
+                raise ValueError("no database path configured")
+            conn = self._conn
 
-            now = datetime.now(timezone.utc).isoformat()
-            rows: list[dict] = list(existing)
+            conn.execute("""
+                INSERT INTO sessions (session_id, num_players, pack_size, current_round, is_complete)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    current_round = excluded.current_round,
+                    is_complete   = excluded.is_complete
+            """, (self._session_id, self._num_players, self._pack_size,
+                  self._current_round, int(self._is_complete)))
 
-            def _empty() -> dict:
-                return {f: "" for f in _CSV_FIELDS}
+            for i, direction in enumerate(self._rounds):
+                conn.execute("""
+                    INSERT OR IGNORE INTO session_rounds (session_id, round_index, pass_direction)
+                    VALUES (?, ?, ?)
+                """, (self._session_id, i, direction))
 
-            meta = _empty()
-            meta.update({
-                "row_type": "METADATA",
-                "session_id": self._session_id,
-                "num_players": self._num_players,
-                "pack_size": self._pack_size,
-                "rounds": "|".join(self._rounds),
-                "player_names": "|".join(self._player_names),
-                "is_complete": str(self._is_complete),
-                "current_round": self._current_round,
-                "timestamp": now,
-            })
-            rows.append(meta)
+            for seat, name in enumerate(self._player_names):
+                conn.execute("""
+                    INSERT OR IGNORE INTO players (session_id, seat, player_name)
+                    VALUES (?, ?, ?)
+                """, (self._session_id, seat, name))
 
+            seat_counts: dict[int, int] = {i: 0 for i in range(self._num_players)}
             for event in self._pick_events:
-                row = _empty()
-                row.update({
-                    "row_type": "PICK",
-                    "session_id": self._session_id,
-                    "pack_id": event.pack_id,
-                    "seat": event.seat,
-                    "player_name": self._player_names[event.seat],
-                    "pick_index": event.pick_index,
-                    "card_name": event.card_name,
-                    "timestamp": now,
-                })
-                rows.append(row)
+                player_pick_num = seat_counts[event.seat]
+                s_idx = event.pack_id.index("S")
+                round_num = int(event.pack_id[1:s_idx])
+                origin_seat = int(event.pack_id[s_idx + 1:])
+                conn.execute("""
+                    INSERT OR IGNORE INTO picks
+                        (session_id, round_number, origin_seat, seat,
+                         pick_index, player_pick_num, card_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (self._session_id, round_num, origin_seat,
+                      event.seat, event.pick_index, player_pick_num, event.card_name))
+                seat_counts[event.seat] += 1
 
+            conn.execute("DELETE FROM results WHERE session_id = ?", (self._session_id,))
             for winner_seat in self._results:
-                row = _empty()
-                row.update({
-                    "row_type": "RESULT",
-                    "session_id": self._session_id,
-                    "winner_seat": winner_seat,
-                    "player_name": self._player_names[winner_seat],
-                    "timestamp": now,
-                })
-                rows.append(row)
+                conn.execute("""
+                    INSERT INTO results (session_id, winner_seat) VALUES (?, ?)
+                """, (self._session_id, winner_seat))
 
-            with self._save_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
-                writer.writeheader()
-                writer.writerows(rows)
+            conn.commit()
 
     @classmethod
-    def load(cls, save_path: str) -> DraftArbiter:
+    def load(cls, db_path: str, session_id: str) -> DraftArbiter:
         """
-        Reconstruct a DraftArbiter from the most recent session in a CSV file.
+        Reconstruct a DraftArbiter from a session stored in the SQLite database.
 
-        Replays all PICK rows in recorded order, advancing rounds as needed,
-        then replays RESULT rows to restore win/loss counts.
+        Replays all pick rows in insertion order, advancing rounds as needed,
+        then replays result rows to restore win/loss counts.
 
         Args:
-            save_path: Path to the CSV file previously written by save().
+            db_path: Path to the SQLite database file previously written by save().
+            session_id: Identifier of the session to load.
 
         Returns:
             arbiter: Fully restored DraftArbiter in the same state as when saved.
         """
-        path = Path(save_path)
-        if not path.exists():
-            raise FileNotFoundError(f"no save file at {save_path!r}")
+        if not Path(db_path).exists():
+            raise FileNotFoundError(f"no database at {db_path!r}")
 
-        metadata: dict | None = None
-        pick_rows: list[dict] = []
-        result_rows: list[dict] = []
+        conn = db.get_connection(db_path)
 
-        with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                rt = row["row_type"]
-                if rt == "METADATA" and metadata is None:
-                    metadata = dict(row)
+        session_row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if session_row is None:
+            conn.close()
+            raise ValueError(f"session {session_id!r} not found in {db_path!r}")
 
-        if metadata is None:
-            raise ValueError(f"no METADATA row found in {save_path!r}")
-
-        target_session = metadata["session_id"]
-
-        with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                rt = row["row_type"]
-                if row.get("session_id") != target_session:
-                    continue
-                if rt == "PICK":
-                    pick_rows.append(dict(row))
-                elif rt == "RESULT":
-                    result_rows.append(dict(row))
+        rounds = [
+            r["pass_direction"] for r in conn.execute(
+                "SELECT pass_direction FROM session_rounds "
+                "WHERE session_id = ? ORDER BY round_index",
+                (session_id,),
+            ).fetchall()
+        ]
+        player_names = [
+            r["player_name"] for r in conn.execute(
+                "SELECT player_name FROM players WHERE session_id = ? ORDER BY seat",
+                (session_id,),
+            ).fetchall()
+        ]
+        pick_rows = conn.execute(
+            "SELECT seat, card_name, round_number FROM picks "
+            "WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        result_rows = conn.execute(
+            "SELECT winner_seat FROM results WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        is_complete = bool(session_row["is_complete"])
+        conn.close()
 
         arbiter = cls(
-            session_id=metadata["session_id"],
-            num_players=int(metadata["num_players"]),
-            pack_size=int(metadata["pack_size"]),
-            rounds=metadata["rounds"].split("|"),
-            player_names=metadata["player_names"].split("|"),
-            save_path=save_path,
+            session_id=session_id,
+            num_players=session_row["num_players"],
+            pack_size=session_row["pack_size"],
+            rounds=rounds,
+            player_names=player_names,
+            db_path=db_path,
         )
 
-        # Replay picks in CSV row order (= original recording order).
-        # advance_round() is called whenever we see picks from the next round.
-        for row in pick_rows:
-            pack_round = cls._round_from_pack_id(row["pack_id"])
-            while arbiter._current_round < pack_round:
+        for pick_row in pick_rows:
+            while arbiter._current_round < pick_row["round_number"]:
                 arbiter.advance_round()
-            arbiter.record_pick(int(row["seat"]), row["card_name"])
+            arbiter.record_pick(pick_row["seat"], pick_row["card_name"])
 
-        # If the saved session was fully complete, advance past the final round.
-        if metadata.get("is_complete", "").lower() == "true":
-            if arbiter._round_complete and not arbiter._is_complete:
-                arbiter.advance_round()
+        if is_complete and arbiter._round_complete and not arbiter._is_complete:
+            arbiter.advance_round()
 
-        # Replay results (rebuild win/loss counts without double-counting).
-        for row in result_rows:
-            winner_seat = int(row["winner_seat"])
+        for result_row in result_rows:
+            winner_seat = result_row["winner_seat"]
             arbiter._results.append(winner_seat)
             winner_name = arbiter._player_names[winner_seat]
             for i, name in enumerate(arbiter._player_names):
