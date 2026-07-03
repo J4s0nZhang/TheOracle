@@ -1,7 +1,7 @@
 # TheOracle — Project Reference
 
 ## Overview
-MTG draft tracking website backend. Two core capabilities: (1) resolves OCR-scanned card identifiers to full card data via Scryfall, and (2) manages booster draft sessions end-to-end. Intended as a Python backend package exposed via FastAPI (planned).
+MTG draft tracking website backend. Two core capabilities: (1) resolves OCR-scanned card identifiers to full card data via Scryfall, and (2) manages booster draft sessions end-to-end. Exposed via a FastAPI server with a Jinja2 stats website. N player apps send OCR-scanned picks to the server; the server records all state and serves live stats via browser.
 
 ## Stack
 - **Language:** Python 3.12+
@@ -9,6 +9,8 @@ MTG draft tracking website backend. Two core capabilities: (1) resolves OCR-scan
 - **Build backend:** hatchling (`pyproject.toml`)
 - **HTTP client:** requests
 - **External API:** Scryfall (`https://api.scryfall.com`)
+- **Web framework:** FastAPI + uvicorn
+- **Templates:** Jinja2 (server-rendered HTML)
 - **Test framework:** pytest 9+
 - **Environment:** conda env named `oracle`
 
@@ -19,11 +21,20 @@ src/theoracle/
     card_parser.py        # OCR normalization + Scryfall lookup pipeline
     draft_arbiter.py      # MTG booster draft session manager
     db.py                 # SQLite connection factory + migration runner
+    session_manager.py    # Lobby state + SessionManager registry
+    main.py               # FastAPI app — API routes + website routes
+    templates/
+        base.html         # shared layout (Bootstrap 5)
+        session_stats.html  # live draft view, auto-refreshes every 5s
+        player_history.html # per-player historical picks + pack replay
+        cards.html          # top 50 cards by avg pick order
 migrations/
-    001_initial.sql       # initial schema (sessions, players, picks, results)
+    001_initial.sql       # sessions, players, picks, results
+    002_global_players.sql  # persistent player identity across sessions
 tests/
     test_card_parser.py   # 47 unit tests, all mocked (no network)
     test_draft_arbiter.py # 54 unit tests, SQLite via tmp_path
+    test_api.py           # 29 FastAPI tests, mocked card_parser
 pyproject.toml            # dependencies, build config, pytest config
 ```
 
@@ -33,14 +44,17 @@ pyproject.toml            # dependencies, build config, pytest config
 conda activate oracle
 pip install -e ".[dev]"
 
+# Run the server (default DB: drafts.db in cwd)
+uvicorn theoracle.main:app --reload
+
+# Override DB path
+ORACLE_DB_PATH=/path/to/drafts.db uvicorn theoracle.main:app --reload
+
+# Swagger UI (interactive API docs)
+open http://localhost:8000/docs
+
 # Run tests
 pytest
-
-# Run a specific test file
-pytest tests/test_card_parser.py
-
-# Run a single test
-pytest tests/test_card_parser.py::test_function_name
 ```
 
 ---
@@ -87,9 +101,9 @@ One `DraftArbiter` instance per live draft session. Holds all live state in RAM;
 
 ### Architecture decisions
 - **One arbiter per session** — correct granularity for a web backend (route by `session_id`, each arbiter owns its lock).
-- **No session registry here** — managing multiple live arbiters belongs to the FastAPI layer (planned separately).
-- **SQLite persistence via raw SQL migrations** — schema lives in `migrations/001_initial.sql`; `db.py` applies migrations automatically on connection open. Migration history tracked in `schema_migrations` table.
-- **Explicit round advancement** — `record_pick` never auto-advances rounds. The coordinator calls `advance_round()` after `is_round_complete()` returns `True`, giving the web layer a natural gate for "round over" UI.
+- **Session registry lives in `SessionManager`** — `session_manager.py` owns the lobby lifecycle and maps `session_id → DraftArbiter` once a session starts.
+- **SQLite persistence via raw SQL migrations** — schema lives in `migrations/`; `db.py` applies migrations automatically on connection open. Migration history tracked in `schema_migrations` table.
+- **Explicit round advancement** — `record_pick` never auto-advances rounds. The host calls `POST /sessions/{id}/advance` after `is_round_complete()`, giving the web layer a natural gate for "round over" UI.
 
 ### Public API
 ```python
@@ -143,7 +157,8 @@ arbiter.replay_draft()                     # list[PickEvent] in recording order
 - `get_card_stats(name)` / `get_all_card_stats()` — queries DB for other sessions, combines with current session RAM (no double-counting).
 
 ### SQL schema (SQLite)
-Five tables: `sessions`, `session_rounds`, `players`, `picks`, `results`. Multiple sessions share one DB file. Key design choices:
+Six tables: `global_players`, `sessions`, `session_rounds`, `players`, `picks`, `results`. Multiple sessions share one DB file. Key design choices:
+- `global_players` — maps `player_id (UUID) → player_name`; ensures same player gets same ID across sessions
 - `picks.pick_index` — 0-based position within a pack (enables avg-pick-order queries directly)
 - `picks.player_pick_num` — 0-based sequential pick number for that player within the session (stored at save time; avoids window functions for "first X picks" queries)
 - `picks(round_number, origin_seat)` decompose `pack_id` for queryable pack reconstruction
@@ -156,6 +171,72 @@ Five tables: `sessions`, `session_rounds`, `players`, `picks`, `results`. Multip
 
 ---
 
+## Module: `theoracle.session_manager`
+
+Manages the pre-draft lobby and holds live `DraftArbiter` instances after sessions start.
+
+### Data classes
+- **`LobbyPlayer`** — `player_id`, `player_name`, `is_host`
+- **`LobbySession`** — `session_id`, `host_player_id`, `num_players`, `pack_size`, `rounds`, `db_path`, `players`, `status` (`"waiting"` | `"active"` | `"complete"`), `seat_map` (`player_id → seat`), `arbiter`, `lock`
+
+### `SessionManager` public API
+```python
+manager = SessionManager()
+
+session_id, player_id = manager.create_session(player_name, num_players, pack_size, rounds, db_path)
+player_id = manager.join_session(session_id, player_name, db_path)
+seat_map  = manager.start_session(session_id, host_player_id)   # randomly assigns seats
+session   = manager.get_session(session_id)
+ok        = manager.verify_player_seat(session_id, player_id, seat)
+```
+
+### Player identity
+`player_name` is the stable global key. First time a name appears, a UUID4 `player_id` is generated and stored in `global_players`. Subsequent sessions with the same name return the same `player_id`, enabling cross-session history on the website.
+
+---
+
+## Module: `theoracle.main` — FastAPI App
+
+Single `SessionManager` instance + `DB_PATH` (env var `ORACLE_DB_PATH`, default `drafts.db`) shared across all requests.
+
+### API Routes (JSON — for player apps)
+
+| Method | Path | Who | Description |
+|--------|------|-----|-------------|
+| `POST` | `/sessions` | Host | Create session. Body: `player_name, num_players, pack_size, rounds`. Returns `session_id, player_id`. |
+| `POST` | `/sessions/{id}/join` | Player | Join lobby. Body: `player_name`. Returns `player_id`. |
+| `GET`  | `/sessions/{id}` | All | Lobby/session state. Poll this during lobby to detect when session starts and seats are assigned. |
+| `POST` | `/sessions/{id}/start` | Host | Lock roster, randomly assign seats, begin draft. Body: `player_id`. Returns `seat_assignments`. |
+| `POST` | `/sessions/{id}/picks` | Player | Submit pick. Body: `player_id, seat, card_id`. Server resolves `card_id` via `parse_card_identifier`. Returns `card_name, pack_id, pick_index, seat`. |
+| `POST` | `/sessions/{id}/advance` | Host | Advance to next round (only when round is complete). Body: `player_id`. |
+| `POST` | `/sessions/{id}/results` | Host | Record match result. Body: `player_id, winner_seat`. |
+
+### Error codes
+| Code | Meaning |
+|------|---------|
+| 404 | Session or player not found |
+| 403 | `player_id` doesn't match `seat`, or action requires host |
+| 409 | Action invalid for current session state (wrong status, session full, name taken) |
+| 422 | Card not identified — retry; or `ValueError` from `DraftArbiter` |
+| 503 | Scryfall unavailable |
+
+### Website Routes (HTML)
+
+| Path | Description |
+|------|-------------|
+| `/sessions/{id}/stats` | Live session stats. Auto-refreshes every 5s while active. |
+| `/players/{player_id}` | Player's full draft history — pack seen at each pick + card chosen. |
+| `/cards` | Top 50 cards by average pick order (highest = taken latest). |
+
+### Testing pattern
+```python
+# Inject fresh manager + tmp DB per test
+app.dependency_overrides[get_manager] = lambda: SessionManager()
+app.dependency_overrides[get_db_path] = lambda: str(tmp_path / "test.db")
+```
+
+---
+
 ## Code Style Rules
 - No comments unless the WHY is non-obvious
 - No type annotations on local variables — only on function signatures
@@ -163,18 +244,31 @@ Five tables: `sessions`, `session_rounds`, `players`, `picks`, `results`. Multip
 - Tests must never hit the network — patch `theoracle.card_parser.requests.get` and `theoracle.card_parser.time.sleep`
 - `autouse` fixture `no_sleep` suppresses `time.sleep` globally in `test_card_parser.py`
 - Draft arbiter tests use `tmp_path` fixture for SQLite I/O; no mocking needed (pure in-memory except persistence tests)
+- API tests use `TestClient` with dependency overrides for `get_manager` and `get_db_path`; patch `theoracle.main.parse_card_identifier` for pick tests
+
+---
+
+## Next Session Action Items
+
+1. **Understand the APIs and DraftArbiter structure** — Read through `draft_arbiter.py`, `session_manager.py`, and `main.py` before making changes. Key things to internalize: how `LobbySession` transitions from `waiting → active → complete`, how `DraftArbiter` assigns packs to seats and passes them, and how `save()` + `load()` work. The Swagger UI at `/docs` (run the server first) is the fastest way to see the full API surface interactively.
+
+2. **Share the API spec with the app developer** — The player app needs to call these endpoints in order:
+   - `POST /sessions` (host only, at session creation)
+   - `POST /sessions/{id}/join` (each player, returns their persistent `player_id`)
+   - `GET /sessions/{id}` — poll until `status == "active"` and `seat` is assigned
+   - `POST /sessions/{id}/start` (host only, once all players have joined)
+   - `POST /sessions/{id}/picks` — body: `{ player_id, seat, card_id }` — on 422 with "retry", re-scan
+   - `POST /sessions/{id}/advance` (host only, after round is complete)
+   - `POST /sessions/{id}/results` (host only, to record match outcomes)
+   The Swagger UI at `http://localhost:8000/docs` shows full request/response schemas. Direct the app dev there.
+
+3. **End-to-end smoke test with dummy apps** — Write a small script (or set of `curl`/`httpx` calls) that simulates N players sending picks concurrently, runs through a full draft, and checks the stats website renders correctly. Good test parameters: `num_players=4, pack_size=5, rounds=["left","right","left"]`. Verify the `/sessions/{id}/stats` page updates live, and `/players/{player_id}` shows the correct pack history after the session completes.
 
 ---
 
 ## Planned Next Steps
 
-### Priority 1 — FastAPI web backend
-Session registry + HTTP endpoints. Key design: one `DraftArbiter` per live session, registry maps `session_id → DraftArbiter`, loaded from DB on server startup.
-- `POST /sessions` — create session
-- `POST /sessions/{id}/picks` — record pick
-- `POST /sessions/{id}/advance` — advance round
-- `GET /sessions/{id}/stats` — player stats
-- `POST /cards/identify` — expose `parse_card_identifier`
+### Priority 2 — End-to-end smoke test (see Action Item 3 above)
 
 ### Priority 3 — Third Scryfall fallback
 `GET /cards/named?fuzzy={name}` when OCR also emits a card name (marked TODO in `fetch_card`).

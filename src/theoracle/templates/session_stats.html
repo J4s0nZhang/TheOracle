@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block refresh %}
+{% if status == "active" %}
+<meta http-equiv="refresh" content="5">
+{% endif %}
+{% endblock %}
+
+{% block title %}Session {{ session_id[:8] }} — TheOracle{% endblock %}
+
+{% block content %}
+<div class="d-flex align-items-center justify-content-between mb-3">
+  <h2 class="mb-0">Draft Session <code>{{ session_id[:8] }}</code></h2>
+  <span class="badge {% if status == 'active' %}bg-success{% elif status == 'complete' %}bg-secondary{% else %}bg-warning text-dark{% endif %} fs-6">
+    {{ status }}
+  </span>
+</div>
+
+{% if status == "waiting" %}
+  <div class="alert alert-info">
+    Waiting for players to join. {{ players | length }} / {{ num_players }} joined.
+  </div>
+  <ul class="list-group mb-4" style="max-width: 400px">
+    {% for p in players %}
+    <li class="list-group-item d-flex justify-content-between align-items-center">
+      {{ p.player_name }}
+      {% if p.is_host %}<span class="badge bg-primary">host</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+
+{% else %}
+  <div class="row mb-3">
+    <div class="col-auto">
+      <strong>Round:</strong> {{ current_round + 1 }} / {{ num_rounds }}
+    </div>
+    <div class="col-auto">
+      {% if is_draft_complete %}
+        <span class="badge bg-secondary">Draft complete</span>
+      {% elif is_round_complete %}
+        <span class="badge bg-warning text-dark">Round complete — awaiting advance</span>
+      {% else %}
+        <span class="badge bg-success">Picking in progress</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <table class="table table-striped table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th>Seat</th>
+        <th>Player</th>
+        <th>Picks ({{ pack_size * num_rounds }} total)</th>
+        <th>W / L</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in players %}
+      <tr>
+        <td>{{ p.seat }}</td>
+        <td>
+          {{ p.player_name }}
+          {% if p.is_host %}<span class="badge bg-primary ms-1">host</span>{% endif %}
+        </td>
+        <td>
+          {% set stats = player_stats[p.seat] %}
+          {% if stats %}
+            <span class="text-muted small">{{ stats.picked_cards | join(", ") or "—" }}</span>
+          {% else %}
+            —
+          {% endif %}
+        </td>
+        <td>
+          {% if stats %}{{ stats.wins }} / {{ stats.losses }}{% else %}—{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

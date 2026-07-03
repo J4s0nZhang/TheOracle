@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}{{ player_name }}'s Draft History — TheOracle{% endblock %}
+
+{% block content %}
+<h2>{{ player_name }}'s Draft History</h2>
+
+{% if not sessions %}
+  <div class="alert alert-secondary">No completed picks found for this player.</div>
+{% endif %}
+
+{% for session in sessions %}
+<div class="card mb-4">
+  <div class="card-header d-flex justify-content-between">
+    <strong>Session <code>{{ session.session_id[:8] }}</code></strong>
+    <a href="/sessions/{{ session.session_id }}/stats" class="btn btn-sm btn-outline-secondary">View session</a>
+  </div>
+  <div class="card-body p-0">
+    <table class="table table-sm table-hover mb-0">
+      <thead class="table-light">
+        <tr>
+          <th>#</th>
+          <th>Round</th>
+          <th>Pack</th>
+          <th>Cards seen</th>
+          <th>Picked</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for pick in session.picks %}
+        <tr>
+          <td class="text-muted">{{ loop.index }}</td>
+          <td>{{ pick.round + 1 }}</td>
+          <td><code>{{ pick.pack_id }}</code></td>
+          <td>
+            {% if pick.pack_before %}
+              <span class="text-muted small">{{ pick.pack_before | join(" · ") }}</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td><strong>{{ pick.card_picked }}</strong></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

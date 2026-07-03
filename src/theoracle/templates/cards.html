@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}Card Stats — TheOracle{% endblock %}
+
+{% block content %}
+<h2>Card Stats</h2>
+<p class="text-muted">Top 50 cards by average pick order (highest = taken latest in pack). Lower avg pick = more coveted.</p>
+
+{% if not cards %}
+  <div class="alert alert-secondary">No picks recorded yet.</div>
+{% else %}
+  <table class="table table-striped table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th>#</th>
+        <th>Card</th>
+        <th>Times Picked</th>
+        <th>Avg Pick Order</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for card in cards %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ card.card_name }}</td>
+        <td>{{ card.times_selected }}</td>
+        <td>{{ "%.1f" | format(card.avg_pick_order) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}
